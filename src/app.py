@@ -7,26 +7,47 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import tensorflow as tf
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel, Field, ConfigDict
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 
 # --- Schemas ---
 class CryptoRequest(BaseModel):
-    ticker: str = Field(default="BTC-USD", description="Ticker do Criptoativo (ex: BTC-USD)")
+    ticker: str = Field(default="BTC-USD", description="Ticker do criptoativo. Apenas BTC-USD é suportado")
+
+class ConfidenceIntervalResponse(BaseModel):
+    low_usd: float = Field(description="Limite inferior em USD")
+    high_usd: float = Field(description="Limite superior em USD")
 
 class PredictionResponse(BaseModel):
-    ticker: str
-    prediction_type: str
-    predicted_price_usd: float
-    processing_time_ms: float
+    ticker: str = Field(description="Ticker previsto")
+    prediction_type: str = Field(description="Tipo de previsão")
+    predicted_price_usd: float = Field(description="Preço previsto para o fechamento da próxima hora")
+    forecast_for_utc: str = Field(description="Início da hora prevista em UTC (ISO-8601)")
+    forecast_for_brt: str = Field(description="Início da hora prevista em Brasília (ISO-8601)")
+    forecast_close_utc: str = Field(description="Fechamento da hora prevista em UTC (ISO-8601)")
+    forecast_close_brt: str = Field(description="Fechamento da hora prevista em Brasília (ISO-8601)")
+    confidence_interval_95_usd: ConfidenceIntervalResponse | None = Field(default=None, description="Intervalo de confiança estimado de 95%")
+    estimated_error_pct: float | None = Field(default=None, description="Erro percentual estimado com base nas métricas do modelo")
+    processing_time_ms: float = Field(description="Tempo de processamento da requisição em milissegundos")
 
 class HealthResponse(BaseModel):
-    status: str
-    artifacts_ready: bool
-    cpu_usage: float
-    memory_usage: float
-    details: str | None = None
+    model_config = ConfigDict(protected_namespaces=())
+
+    status: str = Field(description="healthy quando todos os checks passam; caso contrário degraded")
+    artifacts_ready: bool = Field(description="Modelo e scaler carregados")
+    model_usable: bool = Field(description="Modelo responde a uma inferência de sanidade")
+    market_data_accessible: bool = Field(description="Consulta de mercado disponível")
+    last_market_timestamp_utc: str | None = Field(default=None, description="Último candle válido em UTC (ISO-8601)")
+    last_market_timestamp_brt: str | None = Field(default=None, description="Último candle válido em Brasília (ISO-8601)")
+    cpu_usage: float = Field(description="Uso atual de CPU (%)")
+    memory_usage: float = Field(description="Uso atual de memória (%)")
+    details: str | None = Field(default=None, description="Detalhes quando status=degraded")
+
+class LiveResponse(BaseModel):
+    status: str = Field(description="alive quando a API está respondendo")
+    artifacts_ready: bool = Field(description="Modelo e scaler carregados")
 
 # --- Lifecycle ---
 ml_artifacts = {}
@@ -39,6 +60,7 @@ CACHE_TTL_SECONDS = 30
 YFINANCE_TIMEOUT_SECONDS = 10
 YFINANCE_MAX_RETRIES = 3
 market_cache = {}
+BRASILIA_TZ = "America/Sao_Paulo"
 
 def remove_incomplete_hour_candle(series: pd.Series) -> pd.Series:
     if len(series) < 2:
@@ -71,6 +93,112 @@ def set_cached_market_data(ticker: str, data: pd.DataFrame):
     market_cache[ticker] = {
         "cached_at": time.time(),
         "data": data.copy()
+    }
+
+def timestamp_to_utc_iso(ts: pd.Timestamp) -> str:
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts_utc = ts.tz_localize("UTC")
+    else:
+        ts_utc = ts.tz_convert("UTC")
+    return ts_utc.isoformat()
+
+def timestamp_to_brt_iso(ts: pd.Timestamp) -> str:
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts_utc = ts.tz_localize("UTC")
+    else:
+        ts_utc = ts.tz_convert("UTC")
+    return ts_utc.tz_convert(ZoneInfo(BRASILIA_TZ)).isoformat()
+
+def estimate_uncertainty(predicted_price: float, metadata: dict) -> tuple[float | None, ConfidenceIntervalResponse | None]:
+    metrics = metadata.get("metrics", {}) if isinstance(metadata, dict) else {}
+
+    mape_price = metrics.get("mape_price")
+    rmse_price = metrics.get("rmse_price")
+
+    estimated_error_pct = None
+    if mape_price is not None:
+        estimated_error_pct = float(mape_price)
+    elif rmse_price is not None and predicted_price > 0:
+        estimated_error_pct = float((float(rmse_price) / predicted_price) * 100)
+
+    if rmse_price is not None:
+        margin = 1.96 * float(rmse_price)
+    elif estimated_error_pct is not None:
+        margin = predicted_price * (estimated_error_pct / 100)
+    else:
+        return estimated_error_pct, None
+
+    ci = ConfidenceIntervalResponse(
+        low_usd=round(max(0.0, predicted_price - margin), 2),
+        high_usd=round(predicted_price + margin, 2)
+    )
+    return estimated_error_pct, ci
+
+def load_trained_model(model_path: str):
+    keras_module = getattr(tf, "keras", None)
+    if keras_module is None or not hasattr(keras_module, "models"):
+        raise RuntimeError("TensorFlow/Keras indisponível para carregar o modelo")
+    return keras_module.models.load_model(model_path)
+
+def perform_health_checks() -> dict:
+    model = ml_artifacts.get("model")
+    scaler = ml_artifacts.get("scaler")
+
+    artifacts_ready = model is not None and scaler is not None
+    model_usable = False
+    market_data_accessible = False
+    last_market_timestamp_utc = None
+    last_market_timestamp_brt = None
+    issues = []
+
+    if artifacts_ready:
+        try:
+            if model is None:
+                raise ValueError("Modelo indisponível")
+            sample_input = np.zeros((1, LOOKBACK, 1), dtype=np.float32)
+            prediction = model.predict(sample_input, verbose=0)
+            if prediction is None or len(prediction) == 0:
+                raise ValueError("Predição vazia do modelo")
+            model_usable = True
+        except Exception:
+            issues.append("Modelo carregado, mas não respondeu a inferência de saúde")
+    else:
+        issues.append("Artefatos de modelo/scaler não carregados")
+
+    try:
+        df = download_with_retry(SUPPORTED_TICKER)
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(SUPPORTED_TICKER, axis=1, level=1)
+            except KeyError:
+                df.columns = df.columns.get_level_values(0)
+
+        close_series = df["Close"].dropna()
+        close_series = remove_incomplete_hour_candle(close_series)
+
+        if len(close_series) == 0:
+            raise ValueError("Sem candles válidos")
+
+        market_data_accessible = True
+        last_market_ts = pd.Timestamp(close_series.index[-1])
+        last_market_timestamp_utc = timestamp_to_utc_iso(last_market_ts)
+        last_market_timestamp_brt = timestamp_to_brt_iso(last_market_ts)
+    except Exception:
+        issues.append("Dados de mercado indisponíveis no momento")
+
+    healthy = artifacts_ready and model_usable and market_data_accessible
+    return {
+        "status": "healthy" if healthy else "degraded",
+        "artifacts_ready": artifacts_ready,
+        "model_usable": model_usable,
+        "market_data_accessible": market_data_accessible,
+        "last_market_timestamp_utc": last_market_timestamp_utc,
+        "last_market_timestamp_brt": last_market_timestamp_brt,
+        "cpu_usage": psutil.cpu_percent(),
+        "memory_usage": psutil.virtual_memory().percent,
+        "details": None if healthy else " | ".join(issues)
     }
 
 def download_with_retry(ticker: str) -> pd.DataFrame:
@@ -107,7 +235,7 @@ def download_with_retry(ticker: str) -> pd.DataFrame:
 async def lifespan(app: FastAPI):
     try:
         print("Carregando modelo LSTM Hourly e scaler...")
-        ml_artifacts['model'] = tf.keras.models.load_model(MODEL_PATH)
+        ml_artifacts['model'] = load_trained_model(MODEL_PATH)
         ml_artifacts['scaler'] = joblib.load(SCALER_PATH)
 
         try:
@@ -130,19 +258,54 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Bitcoin Hourly Forecaster", version="2.0.0", lifespan=lifespan)
 
 # --- Endpoints ---
-@app.get("/health", response_model=HealthResponse)
-def health_check():
+@app.get(
+    "/live",
+    response_model=LiveResponse,
+    summary="Liveness da API",
+    description="Endpoint leve para healthcheck de container, sem consulta externa."
+)
+def live_check():
     artifacts_ready = 'model' in ml_artifacts and 'scaler' in ml_artifacts
     return {
-        "status": "healthy" if artifacts_ready else "degraded",
-        "artifacts_ready": artifacts_ready,
-        "cpu_usage": psutil.cpu_percent(),
-        "memory_usage": psutil.virtual_memory().percent,
-        "details": None if artifacts_ready else "Artefatos de modelo/scaler não carregados"
+        "status": "alive",
+        "artifacts_ready": artifacts_ready
     }
 
-@app.post("/predict", response_model=PredictionResponse)
-def predict_next_hour(request: CryptoRequest):
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Saúde efetiva da API",
+    description="Valida artefatos, inferência do modelo e acesso ao mercado. Retorna timestamps em UTC e Brasília."
+)
+def health_check():
+    return perform_health_checks()
+
+@app.post(
+    "/predict",
+    response_model=PredictionResponse,
+    summary="Prevê o próximo fechamento horário",
+    description=(
+        "Aceita apenas o ticker BTC-USD. "
+        "O body é opcional: você pode omitir o body ou enviar {} para usar o padrão BTC-USD. "
+        "Retorna preço previsto, janela temporal da previsão em UTC/Brasília, intervalo de confiança e erro estimado."
+    )
+)
+def predict_next_hour(
+    request: CryptoRequest = Body(
+        default_factory=CryptoRequest,
+        openapi_examples={
+            "sem_body_ou_vazio": {
+                "summary": "Sem body ou body vazio",
+                "description": "Pode omitir o body ou enviar {}. O ticker padrão será BTC-USD.",
+                "value": {}
+            },
+            "body_explicito": {
+                "summary": "Body explícito",
+                "value": {"ticker": "BTC-USD"}
+            }
+        }
+    )
+):
     start_proc = time.perf_counter()
     ticker = request.ticker.upper()
 
@@ -195,7 +358,13 @@ def predict_next_hour(request: CryptoRequest):
         predicted_scaled = model.predict(X_input, verbose=0)
         predicted_log_return = float(scaler.inverse_transform(predicted_scaled).reshape(-1)[0])
         last_close = float(close_series.iloc[-1])
+        last_observed_ts = pd.Timestamp(close_series.index[-1])
+        forecast_for_ts = last_observed_ts + pd.Timedelta(hours=1)
+        forecast_close_ts = forecast_for_ts + pd.Timedelta(hours=1) - pd.Timedelta(seconds=1)
         predicted_price = last_close * np.exp(predicted_log_return)
+
+        metadata = ml_artifacts.get('metadata', {})
+        estimated_error_pct, confidence_interval_95 = estimate_uncertainty(float(predicted_price), metadata)
         
         proc_time = (time.perf_counter() - start_proc) * 1000
         
@@ -203,6 +372,12 @@ def predict_next_hour(request: CryptoRequest):
             "ticker": ticker,
             "prediction_type": "Next Hour Close",
             "predicted_price_usd": round(float(predicted_price), 2),
+            "forecast_for_utc": timestamp_to_utc_iso(forecast_for_ts),
+            "forecast_for_brt": timestamp_to_brt_iso(forecast_for_ts),
+            "forecast_close_utc": timestamp_to_utc_iso(forecast_close_ts),
+            "forecast_close_brt": timestamp_to_brt_iso(forecast_close_ts),
+            "confidence_interval_95_usd": confidence_interval_95,
+            "estimated_error_pct": None if estimated_error_pct is None else round(float(estimated_error_pct), 2),
             "processing_time_ms": round(proc_time, 2)
         }
         
