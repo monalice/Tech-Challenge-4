@@ -13,4 +13,4 @@ COPY models ./models
 
 EXPOSE 8000
 
-CMD ["python", "-m", "uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "if [ ! -f models/lstm_btc_hourly.keras ] || [ ! -f models/scaler_btc.gz ]; then echo '[ERROR] Artefatos ausentes em models/. Necessário: lstm_btc_hourly.keras e scaler_btc.gz'; ls -la models || true; exit 1; fi; python -m uvicorn src.app:app --host 0.0.0.0 --port 8000"]
