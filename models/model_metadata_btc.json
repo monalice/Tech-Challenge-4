@@ -1,0 +1,20 @@
+{
+  "ticker": "BTC-USD",
+  "target": "log_return",
+  "lookback": 60,
+  "interval": "1h",
+  "period": "730d",
+  "seed": 42,
+  "metrics": {
+    "mae_price": 310.81891808461575,
+    "rmse_price": 462.3035113076376,
+    "mape_price": 0.33538547008746783,
+    "mae_price_baseline": 310.8424930217578,
+    "rmse_price_baseline": 462.4146409300536,
+    "mape_price_baseline": 0.33543003417278144,
+    "mae_return": 0.003352346016528015,
+    "mae_return_baseline": 0.00482742863368438,
+    "direction_accuracy_pct": 50.58688806183797
+  },
+  "model_promoted": true
+}
