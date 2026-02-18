@@ -39,6 +39,12 @@ pip install -r requirements.txt
 .venv\Scripts\python -m uvicorn src.app:app --host 127.0.0.1 --port 8000
 ```
 
+## Documentação da API
+
+Após subir a aplicação, acesse:
+
+- Swagger UI: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
 ## Endpoints
 
 - `GET /live`
