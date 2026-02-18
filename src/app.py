@@ -15,6 +15,10 @@ from zoneinfo import ZoneInfo
 # --- Schemas ---
 class CryptoRequest(BaseModel):
     ticker: str = Field(default="BTC-USD", description="Ticker do criptoativo. Apenas BTC-USD é suportado")
+    use_partial_candle: bool = Field(
+        default=False,
+        description="Se true, usa também a vela horária em formação. Se false (padrão), usa apenas velas fechadas"
+    )
 
 class ConfidenceIntervalResponse(BaseModel):
     low_usd: float = Field(description="Limite inferior em USD")
@@ -23,6 +27,9 @@ class ConfidenceIntervalResponse(BaseModel):
 class PredictionResponse(BaseModel):
     ticker: str = Field(description="Ticker previsto")
     prediction_type: str = Field(description="Tipo de previsão")
+    input_mode: str = Field(description="Modo de entrada usado: closed_candles_only ou include_partial_candle")
+    last_input_candle_utc: str = Field(description="Último candle usado como entrada em UTC (ISO-8601)")
+    last_input_candle_brt: str = Field(description="Último candle usado como entrada em Brasília (ISO-8601)")
     predicted_price_usd: float = Field(description="Preço previsto para o fechamento da próxima hora")
     forecast_for_utc: str = Field(description="Início da hora prevista em UTC (ISO-8601)")
     forecast_for_brt: str = Field(description="Início da hora prevista em Brasília (ISO-8601)")
@@ -287,6 +294,7 @@ def health_check():
     description=(
         "Aceita apenas o ticker BTC-USD. "
         "O body é opcional: você pode omitir o body ou enviar {} para usar o padrão BTC-USD. "
+        "Por padrão usa apenas velas fechadas; para incluir a vela em formação, use use_partial_candle=true. "
         "Retorna preço previsto, janela temporal da previsão em UTC/Brasília, intervalo de confiança e erro estimado."
     )
 )
@@ -302,6 +310,11 @@ def predict_next_hour(
             "body_explicito": {
                 "summary": "Body explícito",
                 "value": {"ticker": "BTC-USD"}
+            },
+            "com_vela_parcial": {
+                "summary": "Com vela parcial",
+                "description": "Inclui a vela horária em formação na entrada do modelo.",
+                "value": {"ticker": "BTC-USD", "use_partial_candle": True}
             }
         }
     )
@@ -332,7 +345,8 @@ def predict_next_hour(
             raise HTTPException(status_code=503, detail="Dados de mercado sem coluna Close")
             
         close_series = df['Close'].dropna()
-        close_series = remove_incomplete_hour_candle(close_series)
+        if not request.use_partial_candle:
+            close_series = remove_incomplete_hour_candle(close_series)
 
         required_points = LOOKBACK + 1
         if len(close_series) < required_points:
@@ -371,6 +385,9 @@ def predict_next_hour(
         return {
             "ticker": ticker,
             "prediction_type": "Next Hour Close",
+            "input_mode": "include_partial_candle" if request.use_partial_candle else "closed_candles_only",
+            "last_input_candle_utc": timestamp_to_utc_iso(last_observed_ts),
+            "last_input_candle_brt": timestamp_to_brt_iso(last_observed_ts),
             "predicted_price_usd": round(float(predicted_price), 2),
             "forecast_for_utc": timestamp_to_utc_iso(forecast_for_ts),
             "forecast_for_brt": timestamp_to_brt_iso(forecast_for_ts),

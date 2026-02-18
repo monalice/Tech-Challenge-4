@@ -61,7 +61,12 @@ Após subir a aplicação, acesse:
     - `last_market_timestamp_brt`
 - `POST /predict`
   - Aceita apenas `BTC-USD`.
+  - O body é opcional (`{}` usa os valores padrão).
+  - Por padrão usa apenas velas fechadas. Para incluir a vela em formação, envie `use_partial_candle: true`.
   - Retorna, além do preço previsto:
+    - `input_mode` (modo de entrada usado no modelo)
+    - `last_input_candle_utc` (último candle usado na entrada em UTC)
+    - `last_input_candle_brt` (último candle usado na entrada em Brasília)
     - `forecast_for_utc` (início da hora prevista em UTC)
     - `forecast_for_brt` (início da hora prevista em Brasília)
     - `forecast_close_utc` (fechamento da hora prevista em UTC)
@@ -72,9 +77,21 @@ Após subir a aplicação, acesse:
 
 ```json
 {
-  "ticker": "BTC-USD"
+  "ticker": "BTC-USD",
+  "use_partial_candle": false
 }
 ```
+
+Exemplo com vela parcial:
+
+```json
+{
+  "ticker": "BTC-USD",
+  "use_partial_candle": true
+}
+```
+
+No Swagger (`/docs`), o parâmetro aparece no body do `POST /predict` e também no exemplo **com_vela_parcial**.
 
 ## Treinamento do modelo (opcional)
 
