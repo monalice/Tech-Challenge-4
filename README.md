@@ -4,10 +4,28 @@ API e pipeline de treino para previsão do próximo fechamento horário do Bitco
 
 ## Requisitos
 
+- Docker (recomendado para execução da API)
 - Python 3.11+
 - Ambiente virtual (`.venv`)
 
-## Instalação
+## Executar API com Docker (recomendado)
+
+### Com Docker Compose
+
+```bash
+docker-compose up --build
+```
+
+### Com Docker direto
+
+```bash
+docker build -t stockcast-api:latest .
+docker run --rm -p 8000:8000 stockcast-api:latest
+```
+
+## Execução local (alternativa)
+
+### Instalação
 
 ```bash
 python -m venv .venv
@@ -15,33 +33,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Treinamento
-
-```bash
-python src/train_model.py
-```
-
-Saídas geradas em `models/`:
-
-- Produção (quando supera baseline):
-  - `lstm_btc_hourly.keras`
-  - `scaler_btc.gz`
-  - `model_metadata_btc.json`
-- Candidato (quando não supera baseline):
-  - `lstm_btc_hourly_candidate.keras`
-  - `scaler_btc_candidate.gz`
-  - `model_metadata_btc_candidate.json`
-
-## Regras de promoção do modelo
-
-O modelo só é promovido para produção quando supera o baseline ingênuo (`y_hat = último close`) em:
-
-- MAE (preço)
-- RMSE (preço)
-
-Se não superar, é salvo como candidato e os artefatos de produção atuais não são sobrescritos.
-
-## Executar API local
+### Subir API localmente
 
 ```bash
 .venv\Scripts\python -m uvicorn src.app:app --host 127.0.0.1 --port 8000
@@ -49,10 +41,27 @@ Se não superar, é salvo como candidato e os artefatos de produção atuais nã
 
 ## Endpoints
 
+- `GET /live`
+  - Endpoint leve para liveness (usado no healthcheck do Docker Compose).
+  - Não consulta mercado nem aquece cache da previsão.
 - `GET /health`
-  - Retorna estado da aplicação e prontidão dos artefatos (`artifacts_ready`).
+  - Endpoint de diagnóstico completo.
+  - Retorna estado efetivo da API com validações de:
+    - artefatos carregados
+    - inferência real do modelo
+    - acesso a dados de mercado
+  - Inclui timestamp do último candle válido em:
+    - `last_market_timestamp_utc`
+    - `last_market_timestamp_brt`
 - `POST /predict`
   - Aceita apenas `BTC-USD`.
+  - Retorna, além do preço previsto:
+    - `forecast_for_utc` (início da hora prevista em UTC)
+    - `forecast_for_brt` (início da hora prevista em Brasília)
+    - `forecast_close_utc` (fechamento da hora prevista em UTC)
+    - `forecast_close_brt` (fechamento da hora prevista em Brasília)
+    - `confidence_interval_95_usd` (intervalo de confiança estimado)
+    - `estimated_error_pct` (erro percentual estimado)
   - Exemplo de body:
 
 ```json
@@ -61,14 +70,24 @@ Se não superar, é salvo como candidato e os artefatos de produção atuais nã
 }
 ```
 
-## Build Docker
+## Treinamento do modelo (opcional)
+
+Para testar a API, não é necessário treinar o modelo localmente: os artefatos já estão versionados no repositório. Nesse caso, basta rodar a API com Docker.
+
+Treine localmente apenas se quiser gerar novos artefatos:
 
 ```bash
-docker build -t stockcast-api:latest .
-docker run --rm -p 8000:8000 stockcast-api:latest
+python src/train_model.py
 ```
+
+Saídas geradas em `models/`:
+
+- `lstm_btc_hourly.keras`
+- `scaler_btc.gz`
+- `model_metadata_btc.json`
 
 ## Observações
 
 - A API utiliza cache curto e retry para chamadas ao Yahoo Finance.
+- O healthcheck do Docker Compose usa `GET /live` para evitar impacto em cache de mercado.
 - O pipeline treina em `log-return` e converte previsão para preço final.
