@@ -1,188 +1,319 @@
 import os
+import json
+import time
 import joblib
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import matplotlib.pyplot as plt
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
-# Configurações de Hiperparâmetros e Constantes
-TICKERS = ["BTC-USD", "ETH-USD", "SOL-USD"]   # Treinar modelo separado para cada cripto
-START_DATE = "2020-01-01"  # SOL só tem dados a partir de 2020
-END_DATE = "2025-12-31"
-LOOKBACK = 60         # Janela de observação temporal
-BATCH_SIZE = 32       # Tamanho do lote para atualização de gradiente
-EPOCHS = 1000          # Máximo de épocas (controlado por Early Stopping)
-TEST_SPLIT_DATE = "2024-01-01" # Data de corte para validação cronológica
+# Configurações
+TICKER = "BTC-USD"
+PERIOD = "730d"  
+INTERVAL = "1h"
+
+LOOKBACK = 60
+BATCH_SIZE = 64
+EPOCHS = 100
+TEST_SIZE_PCT = 0.2
+VAL_SIZE_PCT = 0.1
+WALK_FORWARD_SPLITS = 3
+WALK_FORWARD_EPOCHS = 20
+RANDOM_SEED = 42
+EPSILON = 1e-8
+DOWNLOAD_MAX_RETRIES = 3
+DOWNLOAD_TIMEOUT_SECONDS = 10
+
+MODEL_PATH = "models/lstm_btc_hourly.keras"
+SCALER_PATH = "models/scaler_btc.gz"
+MODEL_META_PATH = "models/model_metadata_btc.json"
 
 def ensure_directories():
-    """Garante a existência dos diretórios necessários."""
     if not os.path.exists("models"):
         os.makedirs("models")
 
-def download_financial_data(ticker, start, end):
-    """
-    Realiza o download dos dados históricos via yfinance.
-    Trata o problema de MultiIndex nas versões recentes da biblioteca.
-    """
-    print(f"[INFO] Baixando dados para {ticker} de {start} a {end}...")
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    
-    if df.empty:
-        raise ValueError(f"Não foi possível baixar dados para {ticker}. Verifique se o ticker está correto.")
-    
-    # Tratamento para garantir DataFrame plano (correção para yfinance > 0.2)
-    if isinstance(df.columns, pd.MultiIndex):
+def download_crypto_data():
+    """Baixa dados horários do BTC no Yahoo Finance."""
+    print(f"[INFO] Baixando dados horários ({INTERVAL}) para {TICKER} (Últimos {PERIOD})...")
+
+    df = None
+    last_error = None
+    for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
         try:
-            df = df.xs(ticker, axis=1, level=1)
+            df = yf.download(
+                TICKER,
+                period=PERIOD,
+                interval=INTERVAL,
+                progress=False,
+                timeout=DOWNLOAD_TIMEOUT_SECONDS
+            )
+            if df is not None and not df.empty:
+                break
+        except Exception as error:
+            last_error = error
+
+        if attempt < DOWNLOAD_MAX_RETRIES:
+            time.sleep(0.5 * attempt)
+
+    if df is not None and isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.xs(TICKER, axis=1, level=1)
         except KeyError:
-            # Fallback caso a estrutura seja diferente
             df.columns = df.columns.get_level_values(0)
 
-    # Para criptomoedas usamos Close, para ações usamos Adj Close
-    price_column = 'Close' if 'Close' in df.columns else 'Adj Close'
-    
-    if price_column not in df.columns:
-        raise ValueError(f"Coluna de preço não encontrada. Colunas disponíveis: {df.columns.tolist()}")
-    
-    data = df[[price_column]].copy()
-    data.columns = ['Adj Close']  # Padronizar nome da coluna
-    
-    # Tratamento de Nulos: Forward Fill para propagar o último preço válido
-    data = data.ffill().dropna()
-    
-    if len(data) == 0:
-        raise ValueError(f"Nenhum dado válido encontrado para {ticker}.")
-    
-    print(f"[INFO] {len(data)} dias de dados carregados com sucesso")
+    if df is None or df.empty:
+        raise ValueError(
+            f"A API retornou um DataFrame vazio após {DOWNLOAD_MAX_RETRIES} tentativas. "
+            f"Erro: {last_error}"
+        )
+
+    data = df[['Close']].copy()
+
+    data = data.dropna()
+
+    print(f"[INFO] Total de registros (horas): {len(data)}")
     return data
 
 def create_sliding_window(dataset, look_back=60):
-    """
-    Converte uma série temporal em um conjunto de dados supervisionado.
-    Entrada: Vetor de preços normalizados.
-    Saída: X (features de t-n a t-1) e y (target em t).
-    """
     X, y = [], []
     for i in range(look_back, len(dataset)):
         X.append(dataset[i-look_back:i, 0])
         y.append(dataset[i, 0])
     return np.array(X), np.array(y)
 
+def safe_mape(y_true, y_pred, eps=1e-8):
+    denominator = np.maximum(np.abs(y_true), eps)
+    return np.mean(np.abs((y_true - y_pred) / denominator)) * 100
+
+def run_walk_forward_backtest(X_train, y_train, scaler):
+    if len(X_train) < (WALK_FORWARD_SPLITS + 1):
+        print("[WARN] Dados insuficientes para walk-forward. Backtest pulado.")
+        return
+
+    print(f"[INFO] Iniciando walk-forward backtest com {WALK_FORWARD_SPLITS} splits...")
+    tscv = TimeSeriesSplit(n_splits=WALK_FORWARD_SPLITS)
+    model_maes = []
+    baseline_maes = []
+
+    for fold_idx, (tr_idx, val_idx) in enumerate(tscv.split(X_train), start=1):
+        X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
+        X_val_fold, y_val_fold = X_train[val_idx], y_train[val_idx]
+
+        fold_model = build_lstm_architecture((X_train.shape[1], 1))
+        fold_early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+        fold_model.fit(
+            X_tr,
+            y_tr,
+            batch_size=BATCH_SIZE,
+            epochs=WALK_FORWARD_EPOCHS,
+            validation_data=(X_val_fold, y_val_fold),
+            callbacks=[fold_early_stop],
+            verbose=0
+        )
+
+        y_pred_scaled = fold_model.predict(X_val_fold, verbose=0)
+        y_pred = scaler.inverse_transform(y_pred_scaled).reshape(-1)
+        y_real = scaler.inverse_transform(y_val_fold.reshape(-1, 1)).reshape(-1)
+
+        baseline_scaled = X_val_fold[:, -1, 0].reshape(-1, 1)
+        baseline_pred = scaler.inverse_transform(baseline_scaled).reshape(-1)
+
+        fold_mae = mean_absolute_error(y_real, y_pred)
+        fold_baseline_mae = mean_absolute_error(y_real, baseline_pred)
+
+        model_maes.append(fold_mae)
+        baseline_maes.append(fold_baseline_mae)
+
+        print(
+            f"[WF][Fold {fold_idx}] MAE modelo (retorno): {fold_mae:.6f} | "
+            f"MAE baseline (retorno): {fold_baseline_mae:.6f}"
+        )
+
+    print(
+        f"[WF][Média] MAE modelo (retorno): {np.mean(model_maes):.6f} | "
+        f"MAE baseline (retorno): {np.mean(baseline_maes):.6f}"
+    )
+
 def build_lstm_architecture(input_shape):
-    """
-    Define a topologia da Rede Neural Profunda.
-    Arquitetura: Stacked LSTM com Dropout.
-    """
     model = Sequential()
-    
-    # 1ª Camada LSTM: return_sequences=True é vital para empilhar outra LSTM
-    # 50 neurônios fornecem capacidade suficiente para capturar padrões complexos
-    model.add(LSTM(units=50, return_sequences=True, input_shape=input_shape))
-    model.add(Dropout(0.2)) # Desliga 20% dos neurônios para evitar overfitting
-    
-    # 2ª Camada LSTM: return_sequences=False pois a próxima é Densa
-    model.add(LSTM(units=50, return_sequences=False))
+
+    model.add(LSTM(units=64, return_sequences=True, input_shape=input_shape))
+    model.add(Dropout(0.2)) 
+
+    model.add(LSTM(units=32, return_sequences=False))
     model.add(Dropout(0.2))
-    
-    # Camada Densa para condensar as features em uma predição escalar
-    model.add(Dense(units=25, activation='relu'))
-    model.add(Dense(units=1)) # Saída linear (regressão)
-    
-    # Compilação: Adam é o otimizador padrão para RNNs devido ao momento adaptativo
+
+    model.add(Dense(units=16, activation='relu'))
+    model.add(Dense(units=1))
+
     model.compile(optimizer='adam', loss='mean_squared_error')
-    
     return model
 
 def main():
+    np.random.seed(RANDOM_SEED)
+    tf.random.set_seed(RANDOM_SEED)
+
     ensure_directories()
-    
-    # Treinar um modelo para cada criptomoeda
-    for ticker in TICKERS:
-        print("\n" + "="*60)
-        print(f"TREINANDO MODELO PARA {ticker}")
-        print("="*60)
-        
-        # Gerar nomes de arquivos específicos para cada ticker
-        ticker_name = ticker.split('-')[0].lower()  # btc, eth, sol
-        model_path = f"models/{ticker_name}_model.keras"
-        scaler_path = f"models/{ticker_name}_scaler.gz"
-        
-        # 1. Pipeline de Dados
-        df = download_financial_data(ticker, START_DATE, END_DATE)
-        
-        # Divisão Cronológica (Treino vs Teste)
-        train_data = df[df.index < TEST_SPLIT_DATE]
-        test_data = df[df.index >= TEST_SPLIT_DATE]
-        
-        print(f"[INFO] Treino: {len(train_data)} amostras | Teste: {len(test_data)} amostras")
-        
-        # 2. Normalização
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        scaled_train = scaler.fit_transform(train_data.values)
-        
-        # Transform no teste
-        dataset_total = pd.concat((train_data['Adj Close'], test_data['Adj Close']), axis=0)
-        inputs = dataset_total.values.reshape(-1, 1)
-        scaled_test = scaler.transform(inputs)
-        
-        # Persistência do Scaler
-        joblib.dump(scaler, scaler_path)
-        print(f"[INFO] Scaler salvo em {scaler_path}")
-        
-        # 3. Preparação dos Tensores
-        X_train, y_train = create_sliding_window(scaled_train, LOOKBACK)
-        X_test, y_test = create_sliding_window(scaled_test, LOOKBACK)
-        
-        X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
-        X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
-        
-        # 4. Construção e Treinamento do Modelo
-        model = build_lstm_architecture((X_train.shape[1], 1))
-        early_stop = EarlyStopping(monitor='loss', patience=10, restore_best_weights=True)
-        
-        print(f"[INFO] Iniciando treinamento para {ticker}...")
-        history = model.fit(
-            X_train, y_train,
-            batch_size=BATCH_SIZE,
-            epochs=EPOCHS,
-            callbacks=[early_stop],
-            verbose=1
+
+    df = download_crypto_data()
+
+    close_series = df['Close'].copy()
+    log_price_series = pd.Series(np.log(close_series.values), index=close_series.index)
+    returns_df = log_price_series.diff().dropna().to_frame(name='log_return')
+
+    split_idx = int(len(returns_df) * (1 - TEST_SIZE_PCT))
+    train_data = returns_df.iloc[:split_idx]
+    test_data = returns_df.iloc[split_idx:]
+
+    if len(train_data) <= LOOKBACK:
+        raise ValueError(
+            f"Dados de treino insuficientes. Necessário mais que {LOOKBACK} registros, recebido: {len(train_data)}."
         )
-        
-        # 5. Persistência do Modelo
-        model.save(model_path)
-        print(f"[INFO] Modelo salvo em {model_path}")
-        
-        # 6. Avaliação e Métricas
-        print("[INFO] Gerando predições...")
-        predictions = model.predict(X_test)
-        predictions = scaler.inverse_transform(predictions)
-        y_test_real = scaler.inverse_transform(y_test.reshape(-1, 1))
-        
-        mae = mean_absolute_error(y_test_real, predictions)
-        rmse = np.sqrt(mean_squared_error(y_test_real, predictions))
-        mape = np.mean(np.abs((y_test_real - predictions) / y_test_real)) * 100
-        
-        print("\n" + "="*40)
-        print(f"RELATÓRIO DE PERFORMANCE ({ticker})")
-        print("="*40)
-        print(f"Erro Médio Absoluto (MAE): ${mae:.4f}")
-        print(f"Raiz do Erro Quadrático (RMSE): ${rmse:.4f}")
-        print(f"Erro Percentual Médio (MAPE): {mape:.2f}%")
-        print("="*40)
+    if len(test_data) == 0:
+        raise ValueError("Conjunto de teste vazio. Ajuste TEST_SIZE_PCT.")
     
-    print("\n" + "="*60)
-    print("TREINAMENTO COMPLETO! 3 modelos salvos:")
-    print("  • models/btc_model.keras + btc_scaler.gz")
-    print("  • models/eth_model.keras + eth_scaler.gz")
-    print("  • models/sol_model.keras + sol_scaler.gz")
-    print("="*60)
+    print(f"[INFO] Treino (retornos): {len(train_data)} horas | Teste (retornos): {len(test_data)} horas")
+
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_train = scaler.fit_transform(train_data.values)
+
+    dataset_total = pd.concat((train_data['log_return'], test_data['log_return']), axis=0)
+    inputs = np.asarray(dataset_total.to_numpy(), dtype=float).reshape(-1, 1)
+    scaled_all = scaler.transform(inputs)
+
+    X_train, y_train = create_sliding_window(scaled_train, LOOKBACK)
+
+    X_all, y_all = create_sliding_window(scaled_all, LOOKBACK)
+    test_start_idx_in_windows = split_idx - LOOKBACK
+    if test_start_idx_in_windows < 0:
+        raise ValueError("Split inválido para LOOKBACK atual. Ajuste TEST_SIZE_PCT ou LOOKBACK.")
+
+    X_test = X_all[test_start_idx_in_windows:]
+    y_test = y_all[test_start_idx_in_windows:]
+
+    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+    X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+
+    run_walk_forward_backtest(X_train, y_train, scaler)
+
+    if len(X_train) < 2:
+        raise ValueError("Janelas de treino insuficientes para separar treino/validação.")
+
+    val_size = max(1, int(len(X_train) * VAL_SIZE_PCT))
+    if val_size >= len(X_train):
+        val_size = 1
+
+    X_train_fit = X_train[:-val_size]
+    y_train_fit = y_train[:-val_size]
+    X_val = X_train[-val_size:]
+    y_val = y_train[-val_size:]
+
+    if len(X_train_fit) == 0:
+        raise ValueError("Treino ficou vazio após split de validação. Ajuste VAL_SIZE_PCT.")
+
+    model = build_lstm_architecture((X_train.shape[1], 1))
+
+    early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+
+    history = model.fit(
+        X_train_fit, y_train_fit,
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS,
+        validation_data=(X_val, y_val),
+        callbacks=[early_stop],
+        verbose=1
+    )
+
+    predictions_scaled = model.predict(X_test, verbose=0)
+    predictions_return = scaler.inverse_transform(predictions_scaled).reshape(-1)
+    y_test_return = scaler.inverse_transform(y_test.reshape(-1, 1)).reshape(-1)
+
+    target_indices = dataset_total.index[LOOKBACK + test_start_idx_in_windows: LOOKBACK + test_start_idx_in_windows + len(y_test)]
+    prev_close = close_series.shift(1).reindex(target_indices).values
+    y_test_real_price = close_series.reindex(target_indices).values
+
+    valid_mask = (~np.isnan(prev_close)) & (~np.isnan(y_test_real_price))
+    prev_close = prev_close[valid_mask]
+    y_test_real_price = y_test_real_price[valid_mask]
+    predictions_return = predictions_return[valid_mask]
+    y_test_return = y_test_return[valid_mask]
+
+    predictions_price = prev_close * np.exp(predictions_return)
+
+    baseline_predictions_price = prev_close
+    baseline_scaled = X_test[:, -1, 0].reshape(-1, 1)
+    baseline_return = scaler.inverse_transform(baseline_scaled).reshape(-1)[valid_mask]
+    
+    mae = mean_absolute_error(y_test_real_price, predictions_price)
+    rmse = np.sqrt(mean_squared_error(y_test_real_price, predictions_price))
+    mape = safe_mape(y_test_real_price, predictions_price, EPSILON)
+
+    baseline_mae = mean_absolute_error(y_test_real_price, baseline_predictions_price)
+    baseline_rmse = np.sqrt(mean_squared_error(y_test_real_price, baseline_predictions_price))
+    baseline_mape = safe_mape(y_test_real_price, baseline_predictions_price, EPSILON)
+
+    model_return_mae = mean_absolute_error(y_test_return, predictions_return)
+    baseline_return_mae = mean_absolute_error(y_test_return, baseline_return)
+
+    model_direction = np.sign(predictions_return)
+    real_direction = np.sign(y_test_return)
+    direction_accuracy = np.mean(model_direction == real_direction) * 100
+
+    beats_baseline = mae < baseline_mae and rmse < baseline_rmse
+
+    metadata = {
+        "ticker": TICKER,
+        "target": "log_return",
+        "lookback": LOOKBACK,
+        "interval": INTERVAL,
+        "period": PERIOD,
+        "seed": RANDOM_SEED,
+        "metrics": {
+            "mae_price": float(mae),
+            "rmse_price": float(rmse),
+            "mape_price": float(mape),
+            "mae_price_baseline": float(baseline_mae),
+            "rmse_price_baseline": float(baseline_rmse),
+            "mape_price_baseline": float(baseline_mape),
+            "mae_return": float(model_return_mae),
+            "mae_return_baseline": float(baseline_return_mae),
+            "direction_accuracy_pct": float(direction_accuracy)
+        },
+        "beats_baseline": bool(beats_baseline)
+    }
+
+    model.save(MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    with open(MODEL_META_PATH, "w", encoding="utf-8") as meta_file:
+        json.dump(metadata, meta_file, indent=2, ensure_ascii=False)
+    print(f"[INFO] Modelo salvo em {MODEL_PATH}")
+    
+    print("\n" + "="*40)
+    print(f"RELATÓRIO DE PERFORMANCE ({TICKER} - HORÁRIO)")
+    print("="*40)
+    print(f"Erro Médio Absoluto (MAE): $ {mae:.2f}")
+    print(f"RMSE: $ {rmse:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+    print("-"*40)
+    print("BASELINE INGÊNUO (y_hat = último close da janela)")
+    print(f"MAE Baseline: $ {baseline_mae:.2f}")
+    print(f"RMSE Baseline: $ {baseline_rmse:.2f}")
+    print(f"MAPE Baseline: {baseline_mape:.2f}%")
+    print("-"*40)
+    print("MÉTRICAS DE RETORNO E DIREÇÃO")
+    print(f"MAE Retorno (Modelo): {model_return_mae:.6f}")
+    print(f"MAE Retorno (Baseline): {baseline_return_mae:.6f}")
+    print(f"Acurácia Direcional: {direction_accuracy:.2f}%")
+    print("-"*40)
+    print(f"Modelo superou baseline? {'SIM' if beats_baseline else 'NÃO'}")
+    print("="*40)
 
 if __name__ == "__main__":
     main()

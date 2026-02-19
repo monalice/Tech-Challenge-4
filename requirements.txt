@@ -4,7 +4,7 @@ tensorflow==2.17.1
 pandas==2.2.0
 numpy==1.26.3
 scikit-learn==1.4.0
-yfinance
+yfinance==0.2.54
 psutil==5.9.8
 pydantic==2.6.0
 joblib==1.3.2

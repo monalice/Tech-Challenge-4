@@ -1,4 +1,5 @@
 import time
+import json
 import psutil
 import joblib
 import uvicorn
@@ -6,341 +7,402 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import tensorflow as tf
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # Backend sem GUI
-import io
-import base64
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel, Field, ConfigDict
 from contextlib import asynccontextmanager
-from typing import Optional
+from zoneinfo import ZoneInfo
 
-# --- Schemas Pydantic (Validação de Dados) ---
-class StockRequest(BaseModel):
-    ticker: str = Field(..., description="Símbolo do ativo (ex: AAPL, BTC-USD, PETR4.SA)", min_length=1, max_length=15)
+# --- Schemas ---
+class CryptoRequest(BaseModel):
+    ticker: str = Field(default="BTC-USD", description="Ticker do criptoativo. Apenas BTC-USD é suportado")
+    use_partial_candle: bool = Field(
+        default=False,
+        description="Se true, usa também a vela horária em formação. Se false (padrão), usa apenas velas fechadas"
+    )
 
-class StockResponse(BaseModel):
-    ticker: str
-    prediction_date: str
-    predicted_price: float
-    confidence_interval: dict  # {"lower": float, "upper": float}
-    estimated_error_percentage: float
-    model_version: str
-    processing_time_ms: float
+class ConfidenceIntervalResponse(BaseModel):
+    low_usd: float = Field(description="Limite inferior em USD")
+    high_usd: float = Field(description="Limite superior em USD")
+
+class PredictionResponse(BaseModel):
+    ticker: str = Field(description="Ticker previsto")
+    prediction_type: str = Field(description="Tipo de previsão")
+    input_mode: str = Field(description="Modo de entrada usado: closed_candles_only ou include_partial_candle")
+    last_input_candle_utc: str = Field(description="Último candle usado como entrada em UTC (ISO-8601)")
+    last_input_candle_brt: str = Field(description="Último candle usado como entrada em Brasília (ISO-8601)")
+    predicted_price_usd: float = Field(description="Preço previsto para o fechamento da próxima hora")
+    forecast_for_utc: str = Field(description="Início da hora prevista em UTC (ISO-8601)")
+    forecast_for_brt: str = Field(description="Início da hora prevista em Brasília (ISO-8601)")
+    forecast_close_utc: str = Field(description="Fechamento da hora prevista em UTC (ISO-8601)")
+    forecast_close_brt: str = Field(description="Fechamento da hora prevista em Brasília (ISO-8601)")
+    confidence_interval_95_usd: ConfidenceIntervalResponse | None = Field(default=None, description="Intervalo de confiança estimado de 95%")
+    estimated_error_pct: float | None = Field(default=None, description="Erro percentual estimado com base nas métricas do modelo")
+    processing_time_ms: float = Field(description="Tempo de processamento da requisição em milissegundos")
 
 class HealthResponse(BaseModel):
-    status: str
-    cpu_usage: float
-    memory_usage: float
+    model_config = ConfigDict(protected_namespaces=())
 
-# --- Gestão de Ciclo de Vida da Aplicação ---
-# Variável global para armazenar os artefatos carregados na memória
+    status: str = Field(description="healthy quando todos os checks passam; caso contrário degraded")
+    artifacts_ready: bool = Field(description="Modelo e scaler carregados")
+    model_usable: bool = Field(description="Modelo responde a uma inferência de sanidade")
+    market_data_accessible: bool = Field(description="Consulta de mercado disponível")
+    last_market_timestamp_utc: str | None = Field(default=None, description="Último candle válido em UTC (ISO-8601)")
+    last_market_timestamp_brt: str | None = Field(default=None, description="Último candle válido em Brasília (ISO-8601)")
+    cpu_usage: float = Field(description="Uso atual de CPU (%)")
+    memory_usage: float = Field(description="Uso atual de memória (%)")
+    details: str | None = Field(default=None, description="Detalhes quando status=degraded")
+
+class LiveResponse(BaseModel):
+    status: str = Field(description="alive quando a API está respondendo")
+    artifacts_ready: bool = Field(description="Modelo e scaler carregados")
+
+# --- Lifecycle ---
 ml_artifacts = {}
+SUPPORTED_TICKER = "BTC-USD"
+LOOKBACK = 60
+MODEL_PATH = "models/lstm_btc_hourly.keras"
+SCALER_PATH = "models/scaler_btc.gz"
+MODEL_META_PATH = "models/model_metadata_btc.json"
+CACHE_TTL_SECONDS = 30
+YFINANCE_TIMEOUT_SECONDS = 10
+YFINANCE_MAX_RETRIES = 3
+market_cache = {}
+BRASILIA_TZ = "America/Sao_Paulo"
+
+def remove_incomplete_hour_candle(series: pd.Series) -> pd.Series:
+    if len(series) < 2:
+        return series
+
+    last_ts = pd.Timestamp(series.index[-1])
+    now_utc = pd.Timestamp.utcnow()
+
+    if last_ts.tzinfo is None:
+        now_ref = now_utc.tz_localize(None)
+    else:
+        now_ref = now_utc.tz_convert(last_ts.tz)
+
+    if last_ts >= now_ref.floor("h"):
+        return series.iloc[:-1]
+    return series
+
+def get_cached_market_data(ticker: str) -> pd.DataFrame | None:
+    cache_entry = market_cache.get(ticker)
+    if not cache_entry:
+        return None
+
+    age_seconds = time.time() - cache_entry["cached_at"]
+    if age_seconds > CACHE_TTL_SECONDS:
+        return None
+
+    return cache_entry["data"].copy()
+
+def set_cached_market_data(ticker: str, data: pd.DataFrame):
+    market_cache[ticker] = {
+        "cached_at": time.time(),
+        "data": data.copy()
+    }
+
+def timestamp_to_utc_iso(ts: pd.Timestamp) -> str:
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts_utc = ts.tz_localize("UTC")
+    else:
+        ts_utc = ts.tz_convert("UTC")
+    return ts_utc.isoformat()
+
+def timestamp_to_brt_iso(ts: pd.Timestamp) -> str:
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts_utc = ts.tz_localize("UTC")
+    else:
+        ts_utc = ts.tz_convert("UTC")
+    return ts_utc.tz_convert(ZoneInfo(BRASILIA_TZ)).isoformat()
+
+def estimate_uncertainty(predicted_price: float, metadata: dict) -> tuple[float | None, ConfidenceIntervalResponse | None]:
+    metrics = metadata.get("metrics", {}) if isinstance(metadata, dict) else {}
+
+    mape_price = metrics.get("mape_price")
+    rmse_price = metrics.get("rmse_price")
+
+    estimated_error_pct = None
+    if mape_price is not None:
+        estimated_error_pct = float(mape_price)
+    elif rmse_price is not None and predicted_price > 0:
+        estimated_error_pct = float((float(rmse_price) / predicted_price) * 100)
+
+    if rmse_price is not None:
+        margin = 1.96 * float(rmse_price)
+    elif estimated_error_pct is not None:
+        margin = predicted_price * (estimated_error_pct / 100)
+    else:
+        return estimated_error_pct, None
+
+    ci = ConfidenceIntervalResponse(
+        low_usd=round(max(0.0, predicted_price - margin), 2),
+        high_usd=round(predicted_price + margin, 2)
+    )
+    return estimated_error_pct, ci
+
+def load_trained_model(model_path: str):
+    keras_module = getattr(tf, "keras", None)
+    if keras_module is None or not hasattr(keras_module, "models"):
+        raise RuntimeError("TensorFlow/Keras indisponível para carregar o modelo")
+    return keras_module.models.load_model(model_path)
+
+def perform_health_checks() -> dict:
+    model = ml_artifacts.get("model")
+    scaler = ml_artifacts.get("scaler")
+
+    artifacts_ready = model is not None and scaler is not None
+    model_usable = False
+    market_data_accessible = False
+    last_market_timestamp_utc = None
+    last_market_timestamp_brt = None
+    issues = []
+
+    if artifacts_ready:
+        try:
+            if model is None:
+                raise ValueError("Modelo indisponível")
+            sample_input = np.zeros((1, LOOKBACK, 1), dtype=np.float32)
+            prediction = model.predict(sample_input, verbose=0)
+            if prediction is None or len(prediction) == 0:
+                raise ValueError("Predição vazia do modelo")
+            model_usable = True
+        except Exception:
+            issues.append("Modelo carregado, mas não respondeu a inferência de saúde")
+    else:
+        issues.append("Artefatos de modelo/scaler não carregados")
+
+    try:
+        df = download_with_retry(SUPPORTED_TICKER)
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(SUPPORTED_TICKER, axis=1, level=1)
+            except KeyError:
+                df.columns = df.columns.get_level_values(0)
+
+        close_series = df["Close"].dropna()
+        close_series = remove_incomplete_hour_candle(close_series)
+
+        if len(close_series) == 0:
+            raise ValueError("Sem candles válidos")
+
+        market_data_accessible = True
+        last_market_ts = pd.Timestamp(close_series.index[-1])
+        last_market_timestamp_utc = timestamp_to_utc_iso(last_market_ts)
+        last_market_timestamp_brt = timestamp_to_brt_iso(last_market_ts)
+    except Exception:
+        issues.append("Dados de mercado indisponíveis no momento")
+
+    healthy = artifacts_ready and model_usable and market_data_accessible
+    return {
+        "status": "healthy" if healthy else "degraded",
+        "artifacts_ready": artifacts_ready,
+        "model_usable": model_usable,
+        "market_data_accessible": market_data_accessible,
+        "last_market_timestamp_utc": last_market_timestamp_utc,
+        "last_market_timestamp_brt": last_market_timestamp_brt,
+        "cpu_usage": psutil.cpu_percent(),
+        "memory_usage": psutil.virtual_memory().percent,
+        "details": None if healthy else " | ".join(issues)
+    }
+
+def download_with_retry(ticker: str) -> pd.DataFrame:
+    cached = get_cached_market_data(ticker)
+    if cached is not None:
+        return cached
+
+    last_error = None
+    for attempt in range(1, YFINANCE_MAX_RETRIES + 1):
+        try:
+            df = yf.download(
+                ticker,
+                period="1mo",
+                interval="1h",
+                progress=False,
+                timeout=YFINANCE_TIMEOUT_SECONDS
+            )
+            if df is None or df.empty:
+                raise ValueError("Resposta vazia do Yahoo Finance")
+
+            set_cached_market_data(ticker, df)
+            return df
+        except Exception as error:
+            last_error = error
+            if attempt < YFINANCE_MAX_RETRIES:
+                time.sleep(0.5 * attempt)
+
+    raise HTTPException(
+        status_code=503,
+        detail=f"Falha ao consultar dados de mercado após {YFINANCE_MAX_RETRIES} tentativas"
+    ) from last_error
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Carregamento de modelos na inicialização (Startup Event).
-    Carrega 3 modelos separados: BTC, ETH e SOL.
-    """
     try:
-        print(" Carregando modelos LSTM para BTC, ETH e SOL...")
-        
-        # Carregar modelos para cada criptomoeda
-        for ticker_key in ['btc', 'eth', 'sol']:
-            model_path = f'models/{ticker_key}_model.keras'
-            scaler_path = f'models/{ticker_key}_scaler.gz'
-            
-            try:
-                ml_artifacts[f'{ticker_key}_model'] = tf.keras.models.load_model(model_path)
-                ml_artifacts[f'{ticker_key}_scaler'] = joblib.load(scaler_path)
-                print(f"   ✓ {ticker_key.upper()} modelo carregado")
-            except FileNotFoundError:
-                print(f"   ✗ {ticker_key.upper()} modelo não encontrado em {model_path}")
-        
-        if len(ml_artifacts) == 0:
-            print(" ⚠ Nenhum modelo foi carregado. Treine os modelos primeiro!")
-        else:
-            print(f" Artefatos carregados: {len(ml_artifacts)//2} modelos prontos.")
+        print("Carregando modelo LSTM Hourly e scaler...")
+        ml_artifacts['model'] = load_trained_model(MODEL_PATH)
+        ml_artifacts['scaler'] = joblib.load(SCALER_PATH)
+
+        try:
+            with open(MODEL_META_PATH, "r", encoding="utf-8") as meta_file:
+                ml_artifacts['metadata'] = json.load(meta_file)
+        except FileNotFoundError:
+            ml_artifacts['metadata'] = {
+                "target": "log_return",
+                "lookback": LOOKBACK,
+                "ticker": SUPPORTED_TICKER
+            }
+
+        print("Artefatos carregados com sucesso.")
     except Exception as e:
-        print(f" Falha ao carregar modelos: {e}")
+        ml_artifacts.clear()
+        raise RuntimeError(f"Falha crítica ao carregar artefatos do modelo: {e}") from e
     yield
-    # Cleanup (Shutdown Event)
     ml_artifacts.clear()
-    print(" Memória limpa.")
-    print(" Memória limpa.")
 
-# Inicialização da Aplicação
-app = FastAPI(
-    title="StockCast AI API",
-    description="API de Previsão Financeira baseada em LSTM",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# --- Middleware de Observabilidade ---
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    """
-    Middleware para monitorar a latência de cada requisição.
-    Adiciona o header X-Process-Time e loga a performance.
-    """
-    start_time = time.perf_counter()
-    response = await call_next(request)
-    process_time = time.perf_counter() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-    
-    # Log estruturado (simulado)
-    print(f" Path: {request.url.path} | Method: {request.method} | Time: {process_time:.4f}s")
-    return response
+app = FastAPI(title="Bitcoin Hourly Forecaster", version="2.0.0", lifespan=lifespan)
 
 # --- Endpoints ---
-
-@app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
-def health_check():
-    """
-    Endpoint para Liveness/Readiness Probes (Kubernetes/Docker).
-    Monitora o consumo de recursos do container.
-    """
+@app.get(
+    "/live",
+    response_model=LiveResponse,
+    summary="Liveness da API",
+    description="Endpoint leve para healthcheck de container, sem consulta externa."
+)
+def live_check():
+    artifacts_ready = 'model' in ml_artifacts and 'scaler' in ml_artifacts
     return {
-        "status": "healthy",
-        "cpu_usage": psutil.cpu_percent(),
-        "memory_usage": psutil.virtual_memory().percent
+        "status": "alive",
+        "artifacts_ready": artifacts_ready
     }
 
-@app.post("/predict", response_model=StockResponse, tags=["Inference"])
-def predict_stock(request: StockRequest):
-    """
-    Realiza a inferência ativa do preço de fechamento.
-    1. Baixa dados recentes do Yahoo Finance.
-    2. Aplica pré-processamento (Janela 60 dias + Scaling).
-    3. Executa o modelo LSTM.
-    4. Desnormaliza e retorna o preço.
-    """
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Saúde efetiva da API",
+    description="Valida artefatos, inferência do modelo e acesso ao mercado. Retorna timestamps em UTC e Brasília."
+)
+def health_check():
+    return perform_health_checks()
+
+@app.post(
+    "/predict",
+    response_model=PredictionResponse,
+    summary="Prevê o próximo fechamento horário",
+    description=(
+        "Aceita apenas o ticker BTC-USD. "
+        "O body é opcional: você pode omitir o body ou enviar {} para usar o padrão BTC-USD. "
+        "Por padrão usa apenas velas fechadas; para incluir a vela em formação, use use_partial_candle=true. "
+        "Retorna preço previsto, janela temporal da previsão em UTC/Brasília, intervalo de confiança e erro estimado."
+    )
+)
+def predict_next_hour(
+    request: CryptoRequest = Body(
+        default_factory=CryptoRequest,
+        openapi_examples={
+            "sem_body_ou_vazio": {
+                "summary": "Sem body ou body vazio",
+                "description": "Pode omitir o body ou enviar {}. O ticker padrão será BTC-USD.",
+                "value": {}
+            },
+            "body_explicito": {
+                "summary": "Body explícito",
+                "value": {"ticker": "BTC-USD"}
+            },
+            "com_vela_parcial": {
+                "summary": "Com vela parcial",
+                "description": "Inclui a vela horária em formação na entrada do modelo.",
+                "value": {"ticker": "BTC-USD", "use_partial_candle": True}
+            }
+        }
+    )
+):
     start_proc = time.perf_counter()
     ticker = request.ticker.upper()
-    
-    # Identificar qual modelo usar baseado no ticker
-    ticker_key = None
-    if 'BTC' in ticker:
-        ticker_key = 'btc'
-    elif 'ETH' in ticker:
-        ticker_key = 'eth'
-    elif 'SOL' in ticker:
-        ticker_key = 'sol'
-    else:
+
+    if ticker != SUPPORTED_TICKER:
         raise HTTPException(
-            status_code=400, 
-            detail=f"Ticker '{ticker}' não suportado. Use BTC-USD, ETH-USD ou SOL-USD"
+            status_code=400,
+            detail=f"Este modelo foi treinado apenas para {SUPPORTED_TICKER}."
         )
     
-    # Validação de Artefatos
-    model_key = f'{ticker_key}_model'
-    scaler_key = f'{ticker_key}_scaler'
-    
-    if model_key not in ml_artifacts or scaler_key not in ml_artifacts:
-        raise HTTPException(
-            status_code=503, 
-            detail=f"Modelo para {ticker_key.upper()} não carregado. Treine o modelo primeiro."
-        )
-    
+    if 'model' not in ml_artifacts or 'scaler' not in ml_artifacts:
+        raise HTTPException(status_code=503, detail="Modelo não disponível.")
+        
     try:
-        # 1. Coleta de Dados Recentes (Active Inference)
-        # Baixamos mais dias (100) para garantir 60 dias úteis após feriados
-        df = yf.download(ticker, period="6mo", progress=False)
-        
-        if df.empty:
-            raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' não encontrado no Yahoo Finance.")
-        
-        # Tratamento MultiIndex e Seleção Adj Close
+        # 1. Coleta ativa de mercado com cache e retry
+        df = download_with_retry(ticker)
+            
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df = df.xs(ticker, axis=1, level=1)
             except KeyError:
                 df.columns = df.columns.get_level_values(0)
+
+        if 'Close' not in df.columns:
+            raise HTTPException(status_code=503, detail="Dados de mercado sem coluna Close")
+            
+        close_series = df['Close'].dropna()
+        if not request.use_partial_candle:
+            close_series = remove_incomplete_hour_candle(close_series)
+
+        required_points = LOOKBACK + 1
+        if len(close_series) < required_points:
+            raise HTTPException(status_code=400, detail=f"Dados insuficientes para janela de retorno ({required_points} closes).")
+
+        log_price_series = pd.Series(np.log(close_series.values), index=close_series.index)
+        return_series = log_price_series.diff().dropna()
         
-        # Para criptomoedas usamos Close, para ações usamos Adj Close
-        price_column = 'Close' if 'Close' in df.columns else 'Adj Close'
+        if len(return_series) < LOOKBACK:
+            raise HTTPException(status_code=400, detail=f"Dados insuficientes para gerar janela de retorno de {LOOKBACK}h.")
+
+        # Pega as exatas últimas LOOKBACK janelas de retorno
+        last_returns = np.asarray(return_series.to_numpy()[-LOOKBACK:], dtype=float).reshape(-1, 1)
         
-        if price_column not in df.columns:
-            raise HTTPException(status_code=400, detail=f"Coluna de preço não encontrada para {ticker}")
+        # 2. Pré-processamento
+        scaler = ml_artifacts['scaler']
+        model = ml_artifacts['model']
         
-        data_series = df[price_column].dropna()
+        scaled_input = scaler.transform(last_returns)
+        X_input = np.reshape(scaled_input, (1, LOOKBACK, 1))
         
-        if len(data_series) < 60:
-            raise HTTPException(status_code=400, detail="Histórico insuficiente para este ativo (mínimo 60 dias).")
-        
-        # Seleciona os últimos 60 dias exatos
-        last_60_days = data_series.values[-60:].reshape(-1, 1)
-        
-        # 2. Pré-processamento - Usar o modelo e scaler específicos para este ticker
-        scaler = ml_artifacts[scaler_key]
-        model = ml_artifacts[model_key]
-        
-        # Normalização usando o scaler treinado (Crucial!)
-        scaled_input = scaler.transform(last_60_days)
-        
-        # Reshape para (1, 60, 1) -> (Batch, Timesteps, Features)
-        X_input = np.reshape(scaled_input, (1, 60, 1))
-        
-        # 3. Predição
+        # 3. Inferência
         predicted_scaled = model.predict(X_input, verbose=0)
+        predicted_log_return = float(scaler.inverse_transform(predicted_scaled).reshape(-1)[0])
+        last_close = float(close_series.iloc[-1])
+        last_observed_ts = pd.Timestamp(close_series.index[-1])
+        forecast_for_ts = last_observed_ts + pd.Timedelta(hours=1)
+        forecast_close_ts = forecast_for_ts + pd.Timedelta(hours=1) - pd.Timedelta(seconds=1)
+        predicted_price = last_close * np.exp(predicted_log_return)
+
+        metadata = ml_artifacts.get('metadata', {})
+        estimated_error_pct, confidence_interval_95 = estimate_uncertainty(float(predicted_price), metadata)
         
-        # 4. Pós-processamento (Inverse Transform)
-        predicted_price = scaler.inverse_transform(predicted_scaled)
-        final_price = float(predicted_price[0][0])
-        
-        # 5. Cálculo de Intervalo de Confiança e Erro baseado em volatilidade histórica
-        # Calculamos o desvio padrão dos últimos 30 dias para estimar a incerteza
-        recent_volatility = np.std(data_series.values[-30:])
-        error_percentage = (recent_volatility / data_series.values[-1]) * 100
-        
-        # Intervalo de confiança de 95% (aproximadamente 2 desvios padrões)
-        confidence_margin = 2 * recent_volatility
-        lower_bound = final_price - confidence_margin
-        upper_bound = final_price + confidence_margin
-        
-        processing_time = (time.perf_counter() - start_proc) * 1000 # ms
+        proc_time = (time.perf_counter() - start_proc) * 1000
         
         return {
             "ticker": ticker,
-            "prediction_date": "Next Market Close",
-            "predicted_price": round(final_price, 2),
-            "confidence_interval": {
-                "lower": round(lower_bound, 2),
-                "upper": round(upper_bound, 2)
-            },
-            "estimated_error_percentage": round(error_percentage, 2),
-            "model_version": f"lstm_{ticker_key}",
-            "processing_time_ms": round(processing_time, 2)
+            "prediction_type": "Next Hour Close",
+            "input_mode": "include_partial_candle" if request.use_partial_candle else "closed_candles_only",
+            "last_input_candle_utc": timestamp_to_utc_iso(last_observed_ts),
+            "last_input_candle_brt": timestamp_to_brt_iso(last_observed_ts),
+            "predicted_price_usd": round(float(predicted_price), 2),
+            "forecast_for_utc": timestamp_to_utc_iso(forecast_for_ts),
+            "forecast_for_brt": timestamp_to_brt_iso(forecast_for_ts),
+            "forecast_close_utc": timestamp_to_utc_iso(forecast_close_ts),
+            "forecast_close_brt": timestamp_to_brt_iso(forecast_close_ts),
+            "confidence_interval_95_usd": confidence_interval_95,
+            "estimated_error_pct": None if estimated_error_pct is None else round(float(estimated_error_pct), 2),
+            "processing_time_ms": round(proc_time, 2)
         }
-
-    except HTTPException as he:
-        raise he
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f" Erro na inferência: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno no processamento da predição.")
-
-@app.post("/predict/chart", tags=["Inference"])
-def predict_with_chart(request: StockRequest):
-    """
-    Retorna a previsão junto com um gráfico em formato base64.
-    O gráfico mostra os últimos 60 dias de histórico + previsão com intervalo de confiança.
-    """
-    ticker = request.ticker.upper()
-    
-    # Identificar qual modelo usar
-    ticker_key = None
-    if 'BTC' in ticker:
-        ticker_key = 'btc'
-    elif 'ETH' in ticker:
-        ticker_key = 'eth'
-    elif 'SOL' in ticker:
-        ticker_key = 'sol'
-    else:
-        raise HTTPException(status_code=400, detail=f"Ticker '{ticker}' não suportado. Use BTC-USD, ETH-USD ou SOL-USD")
-    
-    model_key = f'{ticker_key}_model'
-    scaler_key = f'{ticker_key}_scaler'
-    
-    if model_key not in ml_artifacts or scaler_key not in ml_artifacts:
-        raise HTTPException(status_code=503, detail=f"Modelo para {ticker_key.upper()} não carregado.")
-    
-    try:
-        # Baixar dados
-        df = yf.download(ticker, period="6mo", progress=False)
-        if df.empty:
-            raise HTTPException(status_code=404, detail=f"Ticker '{ticker}' não encontrado")
-        
-        # Processar dados
-        if isinstance(df.columns, pd.MultiIndex):
-            try:
-                df = df.xs(ticker, axis=1, level=1)
-            except KeyError:
-                df.columns = df.columns.get_level_values(0)
-        
-        price_column = 'Close' if 'Close' in df.columns else 'Adj Close'
-        data_series = df[price_column].dropna()
-        
-        if len(data_series) < 60:
-            raise HTTPException(status_code=400, detail="Histórico insuficiente")
-        
-        last_60_days = data_series.values[-60:].reshape(-1, 1)
-        historical_dates = data_series.index[-60:]
-        historical_prices = data_series.values[-60:]
-        
-        # Fazer predição
-        scaler = ml_artifacts[scaler_key]
-        model = ml_artifacts[model_key]
-        
-        scaled_input = scaler.transform(last_60_days)
-        X_input = np.reshape(scaled_input, (1, 60, 1))
-        predicted_scaled = model.predict(X_input, verbose=0)
-        predicted_price = scaler.inverse_transform(predicted_scaled)
-        final_price = float(predicted_price[0][0])
-        
-        # Calcular intervalo de confiança
-        recent_volatility = np.std(historical_prices[-30:])
-        confidence_margin = 2 * recent_volatility
-        lower_bound = final_price - confidence_margin
-        upper_bound = final_price + confidence_margin
-        error_percentage = (recent_volatility / historical_prices[-1]) * 100
-        
-        # Criar gráfico
-        plt.figure(figsize=(12, 6))
-        plt.style.use('seaborn-v0_8-darkgrid')
-        
-        # Plotar histórico
-        plt.plot(historical_dates, historical_prices, label='Histórico', color='#2E86AB', linewidth=2)
-        
-        # Plotar previsão
-        next_date = historical_dates[-1] + pd.Timedelta(days=1)
-        plt.scatter([next_date], [final_price], color='#A23B72', s=100, zorder=5, label='Previsão')
-        
-        # Plotar intervalo de confiança
-        plt.fill_between([historical_dates[-1], next_date], 
-                         [historical_prices[-1], lower_bound],
-                         [historical_prices[-1], upper_bound],
-                         alpha=0.3, color='#F18F01', label='Intervalo de Confiança (95%)')
-        
-        # Conectar último preço com previsão
-        plt.plot([historical_dates[-1], next_date], [historical_prices[-1], final_price], 
-                 '--', color='#A23B72', alpha=0.7, linewidth=2)
-        
-        plt.title(f'Previsão de Preço - {ticker}', fontsize=16, fontweight='bold')
-        plt.xlabel('Data', fontsize=12)
-        plt.ylabel('Preço (USD)', fontsize=12)
-        plt.legend(loc='best', fontsize=10)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        # Converter para base64
-        buffer = io.BytesIO()
-        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-        plt.close()
-        
-        return {
-            "ticker": ticker,
-            "predicted_price": round(final_price, 2),
-            "confidence_interval": {
-                "lower": round(lower_bound, 2),
-                "upper": round(upper_bound, 2)
-            },
-            "estimated_error_percentage": round(error_percentage, 2),
-            "chart_base64": image_base64,
-            "chart_format": "png",
-            "model_version": f"lstm_{ticker_key}"
-        }
-    
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f" Erro ao gerar gráfico: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar gráfico: {str(e)}")
+        print(f"Erro interno em /predict: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Falha interna ao gerar previsão")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
